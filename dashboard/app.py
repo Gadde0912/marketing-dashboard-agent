@@ -1,106 +1,119 @@
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-from pathlib import Path
-
-st.set_page_config(page_title="Marketing Monitoring Agent", page_icon="📊", layout="wide")
-st.title("Marketing Performance Dashboard")
-st.caption("POC | Synthetic data | Designed for future Databricks Genie integration")
-
-@st.cache_data
-def load_data():
-    path = Path(__file__).resolve().parents[1] / "data" / "marketing_performance.csv"
-    data = pd.read_csv(path, parse_dates=["date"])
-    return data
-
-df = load_data()
-
-with st.sidebar:
-    st.header("Dashboard filters")
-    min_date, max_date = df.date.min().date(), df.date.max().date()
-    date_range = st.date_input("Date range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
-    regions = st.multiselect("Region", sorted(df.region.unique()), default=sorted(df.region.unique()))
-    channels = st.multiselect("Channel", sorted(df.channel.unique()), default=sorted(df.channel.unique()))
-    campaigns = st.multiselect("Campaign", sorted(df.campaign.unique()), default=sorted(df.campaign.unique()))
-
-if len(date_range) == 2:
-    start_date, end_date = date_range
-else:
-    start_date, end_date = min_date, max_date
-
-filtered = df[
-    df.date.dt.date.between(start_date, end_date)
-    & df.region.isin(regions)
-    & df.channel.isin(channels)
-    & df.campaign.isin(campaigns)
-].copy()
-
 if filtered.empty:
     st.warning("No data matches the selected filters. Please change your filters.")
     st.stop()
 
-spend = filtered.spend.sum()
-revenue = filtered.revenue.sum()
-conversions = filtered.conversions.sum()
-clicks = filtered.clicks.sum()
+spend, revenue = filtered.spend.sum(), filtered.revenue.sum()
+conversions, clicks = filtered.conversions.sum(), filtered.clicks.sum()
 roas = revenue / spend if spend else 0
 cvr = conversions / clicks * 100 if clicks else 0
 
-c1,c2,c3,c4 = st.columns(4)
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("Total Spend", f"₹{spend:,.0f}")
 c2.metric("Total Revenue", f"₹{revenue:,.0f}")
 c3.metric("Conversions", f"{conversions:,.0f}")
 c4.metric("ROAS", f"{roas:.2f}x")
-st.caption(f"Conversion rate: {cvr:.2f}%  |  Records: {len(filtered):,}")
+st.caption(f"Conversion rate: {cvr:.2f}% | Records: {len(filtered):,}")
 
-daily = filtered.groupby("date", as_index=False).agg(spend=("spend","sum"), revenue=("revenue","sum"))
-daily["roas"] = daily.revenue / daily.spend.replace(0, pd.NA)
+daily = filtered.groupby("date", as_index=False).agg(
+    spend=("spend", "sum"), revenue=("revenue", "sum"),
+    conversions=("conversions", "sum"), clicks=("clicks", "sum")
+)
+daily["roas"] = daily.revenue / daily.spend.where(daily.spend != 0)
 
 left, right = st.columns(2)
 with left:
     st.subheader("Revenue and spend trend")
-    trend = daily.melt(id_vars="date", value_vars=["revenue","spend"], var_name="metric", value_name="amount")
+    trend = daily.melt(id_vars="date", value_vars=["revenue", "spend"], var_name="metric", value_name="amount")
     fig = px.line(trend, x="date", y="amount", color="metric", markers=True)
     fig.update_layout(legend_title_text="", yaxis_title="Amount (₹)", xaxis_title="")
     st.plotly_chart(fig, use_container_width=True)
 with right:
     st.subheader("ROAS trend")
     fig = px.line(daily, x="date", y="roas", markers=True)
-    fig.add_vline(x="2026-10-20", line_dash="dash", annotation_text="Synthetic anomaly begins")
+    if pd.Timestamp(start_date) <= ANOMALY_START <= pd.Timestamp(end_date):
+        fig.add_vline(x=ANOMALY_START, line_dash="dash", annotation_text="Monitoring event starts")
     fig.update_layout(yaxis_title="ROAS", xaxis_title="")
     st.plotly_chart(fig, use_container_width=True)
 
 st.subheader("Channel performance")
 channel_perf = filtered.groupby("channel", as_index=False).agg(
-    spend=("spend","sum"), revenue=("revenue","sum"),
-    conversions=("conversions","sum"), clicks=("clicks","sum")
+    spend=("spend", "sum"), revenue=("revenue", "sum"),
+    conversions=("conversions", "sum"), clicks=("clicks", "sum")
 )
-channel_perf["ROAS"] = channel_perf.revenue / channel_perf.spend
-channel_perf["Conversion rate (%)"] = channel_perf.conversions / channel_perf.clicks * 100
+channel_perf["ROAS"] = channel_perf.revenue / channel_perf.spend.replace(0, pd.NA)
+channel_perf["Conversion rate (%)"] = channel_perf.conversions / channel_perf.clicks.replace(0, pd.NA) * 100
 st.dataframe(channel_perf.sort_values("ROAS", ascending=False).round(2), use_container_width=True, hide_index=True)
 
-st.subheader("Monitoring alerts")
-baseline = df[(df.date < pd.Timestamp("2026-10-20")) & df.channel.isin(channels) & df.region.isin(regions) & df.campaign.isin(campaigns)]
-recent = filtered[filtered.date >= pd.Timestamp("2026-10-20")]
-if not baseline.empty and not recent.empty:
-    base_roas = baseline.revenue.sum() / baseline.spend.sum() if baseline.spend.sum() else 0
-    recent_roas = recent.revenue.sum() / recent.spend.sum() if recent.spend.sum() else 0
-    change = ((recent_roas - base_roas) / base_roas * 100) if base_roas else 0
-    if change < -10:
-        st.error(f"ROAS has decreased by {abs(change):.1f}% compared with the pre-20 October baseline. Review channel mix, campaign targeting, and conversion performance.")
+st.subheader("Intelligent anomaly monitoring")
+# Compare average daily spend and conversions so periods of different lengths are fair.
+baseline_daily = filtered[filtered.date < ANOMALY_START].groupby(["channel", "date"], as_index=False).agg(
+    spend=("spend", "sum"), revenue=("revenue", "sum"), conversions=("conversions", "sum")
+)
+recent_daily = filtered[filtered.date >= ANOMALY_START].groupby(["channel", "date"], as_index=False).agg(
+    spend=("spend", "sum"), revenue=("revenue", "sum"), conversions=("conversions", "sum")
+)
+baseline = baseline_daily.groupby("channel", as_index=False).agg(
+    baseline_daily_spend=("spend", "mean"),
+    baseline_daily_conversions=("conversions", "mean"),
+    baseline_revenue=("revenue", "sum"), baseline_spend_total=("spend", "sum")
+)
+recent = recent_daily.groupby("channel", as_index=False).agg(
+    recent_daily_spend=("spend", "mean"),
+    recent_daily_conversions=("conversions", "mean"),
+    recent_revenue=("revenue", "sum"), recent_spend_total=("spend", "sum")
+)
+
+if pd.Timestamp(start_date) < ANOMALY_START and pd.Timestamp(end_date) >= ANOMALY_START:
+    comparison = baseline.merge(recent, on="channel", how="inner")
+    if comparison.empty:
+        st.info("Not enough data to compare the baseline and monitoring periods.")
     else:
-        st.success(f"No major ROAS drop detected against the selected baseline. ROAS change: {change:+.1f}%.")
+        comparison["baseline_roas"] = comparison.baseline_revenue / comparison.baseline_spend_total.replace(0, pd.NA)
+        comparison["recent_roas"] = comparison.recent_revenue / comparison.recent_spend_total.replace(0, pd.NA)
+
+        def pct_change(new, old):
+            return (new - old) / old * 100 if pd.notna(old) and old != 0 else 0.0
+
+        comparison["Spend change (%)"] = comparison.apply(lambda r: pct_change(r.recent_daily_spend, r.baseline_daily_spend), axis=1)
+        comparison["Conversion change (%)"] = comparison.apply(lambda r: pct_change(r.recent_daily_conversions, r.baseline_daily_conversions), axis=1)
+        comparison["ROAS change (%)"] = comparison.apply(lambda r: pct_change(r.recent_roas, r.baseline_roas), axis=1)
+
+        alerts = comparison[
+            (comparison["Spend change (%)"] >= 20)
+            | (comparison["Conversion change (%)"] <= -20)
+            | (comparison["ROAS change (%)"] <= -15)
+        ]
+        if alerts.empty:
+            st.success("No channel crossed the current POC alert thresholds.")
+        else:
+            for _, alert in alerts.iterrows():
+                st.error(
+                    f"{alert['channel']} alert: Spend {alert['Spend change (%)']:+.1f}% | "
+                    f"Conversions {alert['Conversion change (%)']:+.1f}% | "
+                    f"ROAS {alert['ROAS change (%)']:+.1f}%"
+                )
+                if alert["Spend change (%)"] >= 20 and alert["Conversion change (%)"] <= -20:
+                    st.write("Suggested action: Review campaign targeting, bidding strategy, landing-page experience and recent creative changes.")
+                elif alert["ROAS change (%)"] <= -15:
+                    st.write("Suggested action: Check audience quality, conversion tracking and campaign cost efficiency.")
+
+        st.caption("Comparison: selected dates before 20 October vs selected dates from 20 October onward.")
+        st.dataframe(comparison[["channel", "Spend change (%)", "Conversion change (%)", "ROAS change (%)"]].round(2), use_container_width=True, hide_index=True)
 else:
-    st.info("Select a date range that includes both the baseline period and 20 October onward to compare monitoring results.")
+    st.info("Select a date range containing dates before 20 October 2026 and dates from 20 October onward to compare periods.")
 
 st.subheader("Ask the Marketing Agent")
-question = st.text_input("Example: Why did ROAS decrease after 20 October?", placeholder="Ask a question about the displayed marketing metrics")
+question = st.text_input("Ask a question about the displayed marketing metrics", placeholder="Example: Which channel has a ROAS decline?")
 if question:
-    st.info("POC response: This dashboard currently uses rule-based analysis over synthetic data. Databricks Genie conversational answers will be connected in a later phase.")
+    st.info("This POC currently uses rule-based monitoring over synthetic data. Databricks Genie will be connected in a later phase.")
     if "roas" in question.lower() or "return" in question.lower():
-        st.write(f"Current filtered ROAS is **{roas:.2f}x**. Compare channel-level ROAS and the monitoring alert above to identify where performance changed.")
+        st.write(f"Current filtered ROAS is **{roas:.2f}x**. Use the channel comparison above to identify the source of the change.")
+    elif "spend" in question.lower():
+        st.write(f"Current filtered spend is **₹{spend:,.0f}**.")
+    elif "conversion" in question.lower():
+        st.write(f"Current filtered conversions are **{conversions:,.0f}**.")
     else:
         st.write(f"The selected data contains **{len(filtered):,} records**, with **₹{spend:,.0f}** spend and **₹{revenue:,.0f}** revenue.")
 
 st.divider()
-st.caption("Prototype only. All records and insights are synthetic and must not be treated as client or production data.")
+st.caption("Prototype only. All data is synthetic. Alert thresholds are illustrative and require business validation before production use.")
